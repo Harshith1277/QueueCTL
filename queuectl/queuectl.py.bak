@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+import sys, json, time, threading, queue, os
+
+job_queue = queue.Queue()
+dead_letter_queue = []
+workers = []
+worker_threads = []
+
+def log(msg):
+    print(f"[QueueCTL] {msg}")
+
+def enqueue(job_json):
+    try:
+        job = json.loads(job_json)
+        job_queue.put(job)
+        log(f"Enqueued job: {job['id']}")
+    except Exception as e:
+        log(f"Failed to enqueue job: {e}")
+
+def run_job(job):
+    try:
+        log(f"Running job {job['id']}: {job['command']}")
+        result = os.system(job['command'])
+        if result != 0:
+            raise Exception(f"Command failed (exit code {result})")
+        log(f"Job {job['id']} completed successfully ✅")
+    except Exception as e:
+        log(f"Job {job['id']} failed ❌ - {e}")
+        job['max_retries'] -= 1
+        if job['max_retries'] > 0:
+            log(f"Retrying job {job['id']} ({job['max_retries']} retries left)")
+            job_queue.put(job)
+        else:
+            log(f"Job {job['id']} moved to DLQ")
+            dead_letter_queue.append(job)
+
+def worker_loop():
+    while True:
+        try:
+            job = job_queue.get(timeout=2)
+            run_job(job)
+        except queue.Empty:
+            break
+
+def start_workers(count=1):
+    log(f"Starting {count} worker(s)...")
+    for i in range(count):
+        t = threading.Thread(target=worker_loop)
+        t.start()
+        worker_threads.append(t)
+    for t in worker_threads:
+        t.join()
+    log("All workers finished.")
+
+def list_jobs(state):
+    if state == "pending":
+        log(f"{job_queue.qsize()} jobs pending")
+    elif state == "dlq":
+        log(f"{len(dead_letter_queue)} jobs in DLQ")
+
+def smoke_test():
+    log("Running smoke test...")
+    enqueue('{"id":"job1","command":"echo Hello from job1","max_retries":3}')
+    enqueue('{"id":"job2","command":"nonexistent_cmd_xyz","max_retries":2}')
+    start_workers(2)
+    log("DLQ contents:")
+    for job in dead_letter_queue:
+        log(json.dumps(job, indent=2))
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python queuectl.py <command> [args]")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "enqueue":
+        enqueue(sys.argv[2])
+    elif cmd == "status":
+        log(f"Queue size: {job_queue.qsize()} | DLQ: {len(dead_letter_queue)}")
+    elif cmd == "list":
+        if len(sys.argv) > 3 and sys.argv[2] == "--state":
+            list_jobs(sys.argv[3])
+    elif cmd == "worker" and len(sys.argv) > 2:
+        if sys.argv[2] == "start":
+            count = 1
+            if "--count" in sys.argv:
+                count = int(sys.argv[sys.argv.index("--count") + 1])
+            start_workers(count)
+        elif sys.argv[2] == "stop":
+            log("Stopping workers (simulated)...")
+    elif cmd == "dlq":
+        if len(sys.argv) > 2 and sys.argv[2] == "list":
+            list_jobs("dlq")
+        elif len(sys.argv) > 3 and sys.argv[2] == "retry":
+            job_id = sys.argv[3]
+            for job in dead_letter_queue[:]:
+                if job['id'] == job_id:
+                    dead_letter_queue.remove(job)
+                    job_queue.put(job)
+                    log(f"Retried job {job_id}")
+    elif cmd == "smoke-test":
+        smoke_test()
+    else:
+        log(f"Unknown command: {cmd}")
